@@ -5,11 +5,14 @@ interface OwnProps {
     setCodeRaw: Function;
     codeRaw: string;
     highlightLine: number | null;
+    readOnly?: boolean;
 }
 
 type Props = OwnProps;
 
+// Allows editor to be reused within the tool
 export const EditorWindow: FC<Props> = (props) => {
+    // Stores editor instance and current line highlight
     const [editorInstance, setEditorInstance] = useState<any>(null);
     const [decoration, setDecoration] = useState<string[]>(null);
 
@@ -20,9 +23,9 @@ export const EditorWindow: FC<Props> = (props) => {
     }
 
     useEffect(() => {
-        // console.log("Highlight line: ", props.highlightLine);
-        if (!editorInstance || !monaco || props.highlightLine === null)
+        if (!editorInstance || !monaco || props.highlightLine === null){
             return;
+        }
 
         try {
             const alterDecoration = editorInstance.deltaDecorations(decoration || [], [
@@ -43,20 +46,25 @@ export const EditorWindow: FC<Props> = (props) => {
 
     }, [props.highlightLine, editorInstance, monaco]);
 
-    const handleChange = (value: string | undefined, e: any) => {
+    const handleChange = (value: string | undefined) => {
+        if (props.readOnly) {
+            return;
+        }
         props.setCodeRaw(value || "");
     };
 
     return (
         <div className="h-full w-full">
-            {/*[DEBUG]: Line of execution: {props.highlightLine}*/}
             <Editor
                 defaultLanguage="c"
                 height="100%"
                 theme="vs-light"
-                defaultValue={props.codeRaw}
+                value={props.codeRaw}
                 onChange={handleChange}
                 onMount={handleEditorDidMount}
+                options ={{
+                    readOnly: props.readOnly || false
+                }}
             />
         </div>
     );

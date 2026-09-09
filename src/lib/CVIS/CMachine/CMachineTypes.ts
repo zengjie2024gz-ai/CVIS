@@ -15,6 +15,8 @@ export function typeSpecifierToType(type: AST.TypeSpecifier): Type {
 
     if (type.name === 'void') {
         primitiveType = PrimitiveType.VOID;
+    } else if (type.name === 'FILE') {
+        primitiveType = PrimitiveType.FILE;
     } else if (type.name.startsWith('struct')) {
         primitiveType = PrimitiveType.STRUCT;
     } else if (type.name === 'char') {
@@ -256,6 +258,8 @@ export function getPrimitiveTypeSize(primitive: PrimitiveType): number {
             return 8;
         case PrimitiveType.LONG_DOUBLE:
             return 16;
+        case PrimitiveType.FILE:
+            return 4;
         default:
             throw new CMachineError('Execution Error', `Type ${primitive} not found`);
     }
@@ -283,6 +287,7 @@ export enum PrimitiveType {
     LONG_DOUBLE = 'long double',
 
     //non-standard
+    FILE = 'FILE',
     STRUCT = 'struct',
     ENUM = 'enum',
 }

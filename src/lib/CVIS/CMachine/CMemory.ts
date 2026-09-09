@@ -1,18 +1,17 @@
 import {CMemoryError} from "./CMemoryError.ts";
 import {getTypeSize, PrimitiveType, Type, Location} from "@CMachine/CMachineTypes.ts";
 
-/**
- * CVIS Visualisation suite: Virtual Memory - Ben McIlveen
- * Emulates a byte-level virtual memory machine for C programs
- */
-
 // Default memory layout
+// Increased VM memory size for recursive examples
 const MEMORY_START: number = 0;
-const MEMORY_SIZE: number = 512 // 512 Bytes
-const DATA_SIZE: number = 128 // 64 Bytes
-const BSS_SIZE: number = 128 // 64 Bytes
+const MEMORY_SIZE: number = 4096;
+const DATA_SIZE: number = 256;
+const BSS_SIZE: number = 256;
 
-const ALIGNMENT = 4; // DEFAULT: 32-bit alignment
+const ALIGNMENT = 4;
+
+const NULL_RESERVED_START = ALIGNMENT; // Used only for the heap 
+
 
 type MemType = 'stack' | 'heap' | 'bss' | 'data';
 
@@ -42,7 +41,7 @@ export const CProgramLayout = {
     StackPointer: MEMORY_SIZE,
     DataPointer: MEMORY_START,
     BSSPointer: MEMORY_START,
-    HeapPointer: MEMORY_START,
+    HeapPointer: NULL_RESERVED_START,
     DataMaxSize: DATA_SIZE,
     BSSMaxSize: (MEMORY_START + DATA_SIZE) + BSS_SIZE,
 }
@@ -93,7 +92,7 @@ export class VirtualMemoryMachine {
             StackPointer: params.MemorySize,
             DataPointer: MEMORY_START,
             BSSPointer: MEMORY_START,
-            HeapPointer: MEMORY_START,
+            HeapPointer: NULL_RESERVED_START,
             DataMaxSize: params.DataSize,
             BSSMaxSize: (MEMORY_START + params.DataSize) + params.BSSSize
         }
@@ -291,12 +290,12 @@ export class VirtualMemoryMachine {
             return addressInfo.start;
         }
 
-        // get the data
+        // Gets the data
         const value = this.readMemory(address, addressInfo.type);
 
         this.freeMemory(address)
 
-        // Is increasing the size
+        // Increases the size
         const newAddress = this.allocateOnHeap(newSize, addressInfo.identifier, value, type, location);
 
         return newAddress;
@@ -310,7 +309,30 @@ export class VirtualMemoryMachine {
 
         // Remove the allocation
         const range = this.MemoryAllocated[index];
-        if (range.start + range.size === this.HeapPointer) {
+
+        if (range.regionType === "stack") {
+            this.MemoryAllocated.splice(index, 1);
+
+            const stackAllocations = this.MemoryAllocated.filter((allocation) => {
+                return allocation.regionType=== "stack";
+            });
+
+            if (stackAllocations.length === 0) {
+                this.StackPointer = this.ProgramLayout.StackPointer;
+            } else {
+                let lowestStackAddress = stackAllocations[0].start;
+                for (let i = 1; i < stackAllocations.length; i++) {
+                    if (stackAllocations[i].start < lowestStackAddress) {
+                        lowestStackAddress = stackAllocations[i].start;
+                    }
+                }
+                this.StackPointer = lowestStackAddress;
+            }
+
+            return;
+        }
+
+        if (range.regionType === "heap" && range.start + range.size === this.HeapPointer) {
             this.HeapPointer = range.start;
         }
 
@@ -318,25 +340,10 @@ export class VirtualMemoryMachine {
     }
 
     getMemoryInfo(address: number): MemoryAllocation | null {
-        // console.log('Getting memory info', address, this.MemoryAllocated);
         return this.MemoryAllocated.find(r => r.start <= address && address < r.start + r.size) || null;
     }
 
-    // canAccessRange(address: number, size: number): boolean {
-    //     const range = this.getMemoryInfo(address);
-    //     if (!range || !range.allocated) return false;
-    //
-    //     return address + size <= range.start + range.size;
-    // }
-    //
-    // getMemoryState() {
-    //     return {
-    //         stackPointer: this.StackPointer,
-    //         heapPointer: this.HeapPointer,
-    //         memoryAllocated: [...this.MemoryAllocated],
-    //         freeMemory: this.StackPointer - this.HeapPointer
-    //     }
-    // }
+
 
     getHeapDump() {
         return this.MemoryAllocated.filter(r => r.regionType === 'heap');
@@ -344,7 +351,7 @@ export class VirtualMemoryMachine {
 
     writeMemory(address: number, type: Type, value: any): void {
 
-        // Check memory is allocated (can;t write to unallocated memory)
+        // Check memory is allocated to see if it can be written to
         const range = this.getMemoryInfo(address);
         if (!range || !range.allocated) {
             throw new CMemoryError('Memory Write Error', `Attempted to write to unallocated memory at ${address}`);
@@ -414,7 +421,7 @@ export class VirtualMemoryMachine {
 
     readMemory(address: number, type: Type): number {
 
-        // Check memory is allocated (can;t read to unallocated memory)
+        // Check memory is allocated (can't read to unallocated memory)
         const range = this.getMemoryInfo(address);
         if (!range || !range.allocated) {
             throw new CMemoryError('Memory Write Error', `Attempted to read unallocated memory at 0x${address.toString(16).padStart(8, '0')}`);

@@ -4,21 +4,84 @@ import {HardDrive, Link} from "lucide-react";
 import {Tabs, TabsContent, TabsList, TabsTrigger} from "@/components/ui/tabs.tsx";
 import {MemoryDisplay} from "@CVisual/components/MemoryDisplay.tsx";
 import React from "react";
+import {Badge} from "@/components/ui/badge.tsx";
+
 
 interface PointerWindowProps {
     cMachine: ProgramStateMachine,
     variable: Variable
 }
 
-export const PointerWindow = ({cMachine, variable}: PointerWindowProps) => {
+const formatAddress= (address: number) => {
+    return `0x${address.toString(16).toUpperCase().padStart(8, "0")}`;
+};
 
+const PointerStatusCard = ({
+    title, 
+    description,
+    badgeText,
+    colourClass}:{
+        title: string;
+        description: string;
+        badgeText: string;
+        colourClass: string;
+    }) =>{
+        return(
+            <div className="absolute top-[-0.20rem] h-full w-full right-[calc(-100%-0.75rem)]">
+                <div className={`absolute top-[50%] h-1 w-[50px] ${colourClass}`}></div>
+
+                <div className="absolute left-[50px]">
+                    <div className="rounded-md border bg-card p-3">
+                        <div className="mb-2 flex items-center gap-2">
+                            <Badge variant="outline">
+                                {badgeText}
+                            </Badge>
+                        </div>
+
+                        <div className="font-mono text-sm font-medium">
+                            {title}
+                        </div>
+
+                        <div className="mt-1 text-xs text-muted-foreground">
+                            {description}
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        );
+};
+
+export const PointerWindow = ({cMachine, variable}: PointerWindowProps) => {
+    // Address inside pointer variable fetched to determine the message to be displayed
     const variableValue = cMachine.getVariableValue(variable).value;
 
-    const allocation = cMachine.memoryMachine.MemoryAllocated?.find(
-        allocation => variableValue >= allocation.start && variableValue < allocation.start + allocation.size
-    );
+    // Value is 0 meaning NULL
+    if (variableValue===0){
+        return(
+            <PointerStatusCard
+                title="NULL pointer"
+                description="This pointer does not currently point to a heap allocation."
+                badgeText="NULL"
+                colourClass="bg-slate-400"/>
+        );
+    }
 
-    if (!allocation) return <p>Error no link</p>;
+    // Change to using public snapshot instead of previous private 
+
+    const memoryMachine = cMachine.getProgramSnapshot().memory;
+    const allocation = memoryMachine.getMemoryInfo(variableValue);
+
+    if (!allocation){
+        return(
+            <PointerStatusCard
+                title="Dangling or invalid pointer"
+                description={`This pointer still stores ${formatAddress(variableValue)}, but that address is not currently allocated on the heap.`}
+                badgeText="Invalid"
+                colourClass="bg-red-500"/>
+        );
+    }
+
     const memory = cMachine.getHeapSection(allocation.start, allocation.size);
 
     return (

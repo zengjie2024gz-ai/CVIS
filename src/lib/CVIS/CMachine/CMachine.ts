@@ -26,12 +26,82 @@ import {
     Location
 } from "@CMachine/CMachineTypes.ts";
 
-/**
- * CVIS Visualisation suite: Execution Machine - Ben McIlveen
- * Steps through AST nodes, executing one a time with virtual memory
- */
 
 const MAX_LOOP_STEPS = 10000;
+
+// Browser builds cannot open arbitrary host files. These coursework fixtures
+// provide deterministic CSV streams while preserving C's FILE/fgets workflow.
+const DEFAULT_VIRTUAL_FILES: Record<string, string> = {
+    'class01_students.csv': [
+        'id,last_name,first_name',
+        '3444670,Hurrington,Sherri',
+        '3611390,Rich,William',
+        '2939734,Simmons,Erin',
+        '288301,Levi,Antonio',
+        '1295620,Henderson,Mabel',
+        '757790,Coffey,Paula',
+        '3149175,Green,Tom',
+        '3173019,Willis,Hazel',
+        '2890792,Osterberg,Marty',
+        '1274266,Winders,Nancy',
+        ''
+    ].join('\n'),
+    'class01_activity01.csv': [
+        'id,grade',
+        '3444670,30',
+        '2939734,16',
+        '288301,75',
+        '1295620,41',
+        '757790,62',
+        '3149175,56',
+        '3173019,70',
+        '1274266,90',
+        ''
+    ].join('\n'),
+    'class01_activity02.csv': [
+        'id,grade',
+        '3444670,44',
+        '2939734,75',
+        '288301,97',
+        '1295620,29',
+        '757790,89',
+        '3149175,62',
+        '3173019,90',
+        '2890792,13',
+        '1274266,34',
+        ''
+    ].join('\n')
+};
+
+type VirtualFileHandle = {
+    filename: string;
+    mode: string;
+    position: number;
+};
+
+// Marks boundary of function on the execution stack 
+type FunctionReturnMarker = AST.Statement & {
+    type: 'FunctionReturnMarker';
+    stackDepth: number;
+    functionName: string;
+};
+
+type LoopContinueMarker = AST.Statement & {
+    type: 'LoopContinueMarker';
+};
+
+type DeferredExpression = AST.Statement & {
+    type: 'DeferredExpression';
+    expression: AST.Expression;
+    cache: Map<AST.Expression, EvalResult>;
+    pending?: AST.FunctionCall;
+    complete: (result: EvalResult) => void;
+};
+
+class SuspendedCall {
+    constructor(public call: AST.FunctionCall, public args: EvalResult[]) {}
+}
+
 
 export class ProgramStateMachine {
     private memoryMachine: VirtualMemoryMachine;
@@ -46,6 +116,15 @@ export class ProgramStateMachine {
     private debug: boolean;
     private executionStack: AST.Statement[] = [];
     private mallocCounter: number = 0;
+    private virtualFiles: Map<string, string> = new Map(Object.entries(DEFAULT_VIRTUAL_FILES));
+    private openFiles: Map<number, VirtualFileHandle> = new Map();
+    private nextFileHandle: number = 900000;
+    private strtokNextAddress: number | null = null;
+    private returnInProgress: boolean = false; // Tracks when a return has occurred to stop execution
+    private continueInProgress: boolean = false;
+    private expressionCache: Map<AST.Expression, EvalResult> | null = null;
+
+
 
     constructor(ast: AST.Program, virtualLog: (message: string) => void, debug: boolean = false) {
         this.memoryMachine = new VirtualMemoryMachine();
@@ -70,6 +149,16 @@ export class ProgramStateMachine {
         this.executionStack = [];
         this.callStack = [];
         this.currentScope = 0;
+        this.virtualFiles = new Map(Object.entries(DEFAULT_VIRTUAL_FILES));
+        this.openFiles.clear();
+        this.nextFileHandle = 900000;
+        this.strtokNextAddress = null;
+        this.returnInProgress = false;
+        this.continueInProgress = false;
+        this.expressionCache = null;
+        this.returnRegister = undefined;
+        this.mallocCounter = 0;
+
     }
 
     // Setup the program for execution
@@ -102,8 +191,10 @@ export class ProgramStateMachine {
         // Execute the main function
         this.pushStackFrame(mainFrame);
 
-        if (mainEntry.body)
+        if (mainEntry.body){
+            this.pushFunctionReturnMarker('main', mainEntry.body.location);
             this.pushExecutionStack(mainEntry.body);
+        }
         console.log('Main entry added to execution stack');
     }
 
@@ -156,6 +247,40 @@ export class ProgramStateMachine {
         this.executionStack.push(statement);
     }
 
+    // Adds marker to let step-by-step mode know where the function begins
+    private pushFunctionReturnMarker(functionName: string, location: Location): void {
+        this.executionStack.push({
+            type: 'FunctionReturnMarker',
+            functionName,
+            stackDepth: this.callStack.length,
+            location,
+        } as FunctionReturnMarker);
+    }
+
+    private isFunctionReturnMarker(statement?: AST.Statement): statement is FunctionReturnMarker {
+        return statement?.type === 'FunctionReturnMarker';
+    }
+
+    private executeFunctionReturnMarker(marker: FunctionReturnMarker): void {
+        const frame = this.callStack[this.callStack.length- 1];
+
+        if (this.callStack.length === marker.stackDepth && frame?.name === marker.functionName) {
+            this.popStackFrame();
+        }
+    }
+
+    // Removes the next statements (if applicable) from current function after return
+    private clearExecutionStackToCurrentFunctionBoundary(): void {
+        while (this.executionStack.length> 0) {
+            const statement= this.executionStack.pop();
+
+            // Stop running this block if nested return has already happened 
+            if (this.isFunctionReturnMarker(statement)) {
+                return;
+            }
+        }
+    }
+
     // Get the line of the current statement
     private getCurrentStepLine(): number | null {
         if (this.executionStack.length === 0) {
@@ -174,7 +299,14 @@ export class ProgramStateMachine {
         switch (statement.type) {
             case 'LoopBreakOutMarker':
                 return;
+            case 'FunctionReturnMarker':
+                this.executeFunctionReturnMarker(statement as FunctionReturnMarker);
+                return;
             case 'ExpressionStatement':
+                if (step) {
+                    this.evaluateInSteps((statement as AST.ExpressionStatement).expression, () => {});
+                    return;
+                }
                 return this.evaluateExpression(
                     (statement as AST.ExpressionStatement).expression,
                     step
@@ -182,11 +314,15 @@ export class ProgramStateMachine {
             case 'ReturnAssignment':
                 this.executeReturnAssignment(statement as AST.ReturnAssignment);
                 break;
+            case 'DeferredExpression':
+                this.resumeExpression(statement as DeferredExpression);
+                break;
             case 'StructDeclaration':
                 this.evaluateStructDefinition(statement as AST.StructDeclaration);
                 break;
             case 'FunctionCall':
-                this.executeFunctionCall(statement as AST.FunctionCall, step);
+                if (step) this.evaluateInSteps(statement as AST.FunctionCall, () => {});
+                else this.executeFunctionCall(statement as AST.FunctionCall);
                 break;
             case 'CompoundStatement':
                 this.executeCompoundStatement(statement as AST.CompoundStatement, step);
@@ -213,8 +349,13 @@ export class ProgramStateMachine {
             case 'DoWhileStatement':
                 this.executeDoWhileStatement(statement as AST.DoWhileStatement, step);
                 break;
+            case 'LoopContinueMarker':
+                return;
             case 'BreakStatement':
                 this.executeBreakStatement();
+                break;
+            case 'ContinueStatement':
+                this.executeContinueStatement(step);
                 break;
             case 'ReturnStatement':
                 return this.executeReturnStatement(
@@ -233,6 +374,18 @@ export class ProgramStateMachine {
                     `Unrecognised statement ${statement.type}`
                 );
         }
+    }
+    executeContinueStatement(step: boolean= false): void {
+        if (step) {
+            let statement = this.executionStack.pop();
+
+            while (statement && statement.type !== 'LoopContinueMarker') {
+                statement = this.executionStack.pop();
+            }
+            return;
+        }
+
+        this.continueInProgress = true;
     }
 
     // Execute a return assignment
@@ -257,7 +410,7 @@ export class ProgramStateMachine {
 
         // If there was a variable assigned, write the return value to memory
         if (variable) {
-            this.memoryMachine.writeMemory(variable.address, frame.returnType, returnValue);
+            this.memoryMachine.writeMemory(variable.address, variable.type, returnValue);
         }
     }
 
@@ -276,29 +429,37 @@ export class ProgramStateMachine {
     }
 
     // Recursively execute a return statement
+    // After return, stop the current function from running any more statements 
     private executeReturnStatement(
         statement: AST.ReturnStatement,
         step: boolean = false
-    ): any {
+    ):any{
         if (this.debug)
-            console.log('Executing Return Statement', statement);
+            console.log('Executing return statment', statement);
 
-        // is there a LoopBreakOutMarker
-        let isLoopBreakOutMarker = this.executionStack.reduce((acc, statement) => acc || statement.type === 'LoopBreakOutMarker', false);
-        if (isLoopBreakOutMarker)
-            this.executeBreakStatement();
-
-        // Set the return register to the value of the expression if present
-        if (statement.argument) {
-            let returnValue = this.evaluateExpression(statement.argument, step).value;
-            this.returnRegister = returnValue;
-            this.popStackFrame();
-            return returnValue;
+        if (step && statement.argument) {
+            this.evaluateInSteps(statement.argument, result => {
+                this.returnRegister = result.value;
+                this.clearExecutionStackToCurrentFunctionBoundary();
+                this.popStackFrame();
+            });
+            return;
         }
 
-        // Pop off the stack frame
+        let returnValue: any;
+
+        if (statement.argument) {
+            returnValue = this.evaluateExpression(statement.argument, false).value;
+            this.returnRegister = returnValue;
+        }
+
+        if (step) {
+            this.clearExecutionStackToCurrentFunctionBoundary();
+        } else {
+            this.returnInProgress = true;
+        }
         this.popStackFrame();
-        return;
+        return returnValue;
     }
 
 
@@ -381,6 +542,10 @@ export class ProgramStateMachine {
         } else {
             for (let caseStatement of cases) {
                 this.executeStatement(caseStatement.consequent);
+
+                if (this.returnInProgress) {
+                    return;
+                }
             }
         }
 
@@ -428,6 +593,10 @@ export class ProgramStateMachine {
             let loopCount = 0;
             do {
                 this.executeStatement(statement.body);
+
+                if (this.returnInProgress) {
+                    return;
+                }
                 condition = this.evaluateExpression(statement.condition).value != 0;
                 loopCount++;
             } while (condition && loopCount < MAX_LOOP_STEPS);
@@ -444,10 +613,6 @@ export class ProgramStateMachine {
         statement: AST.WhileStatement,
         step: boolean = false
     ): void {
-        /*
-            FIX: when a while loop is being written in full execute mode the typign of say while(a ...) will
-            stop at A and continue to execute it.
-            */
 
         // Add loop marker for breakout
         this.executionStack.push({type: 'LoopBreakOutMarker', location: statement.location});
@@ -458,12 +623,25 @@ export class ProgramStateMachine {
         if (step) {
             if (condition) {
                 this.pushExecutionStack(statement);
+                this.pushExecutionStack({type: 'LoopContinueMarker', location: statement.location} as LoopContinueMarker);
                 this.pushExecutionStack(statement.body);
             }
         } else {
             let loopCount = 0;
             while (condition && loopCount < MAX_LOOP_STEPS) {
                 this.executeStatement(statement.body);
+                
+                if (this.returnInProgress) {
+                    return;
+                }
+
+                if (this.continueInProgress) {
+                    this.continueInProgress = false;
+                    condition = this.evaluateExpression(statement.condition).value != 0;
+                    loopCount++;
+                    continue;
+                }
+
                 condition = this.evaluateExpression(statement.condition).value != 0;
                 loopCount++;
             }
@@ -484,7 +662,6 @@ export class ProgramStateMachine {
         // Add loop marker for breakout
         this.executionStack.push({type: 'LoopBreakOutMarker', location: statement.location});
 
-        // ANSI C doesn't have declarations in loop - this would need to be changed a fair bit if ever expanded for later versions.
         let varAssignment = statement.init as AST.Expression;
         let testCondition = statement.test;
         let update = statement.update;
@@ -510,6 +687,7 @@ export class ProgramStateMachine {
 
                 // Execute the update
                 this.pushExecutionStack({type: 'ExpressionStatement', expression: update} as AST.ExpressionStatement);
+                this.pushExecutionStack({type: 'LoopContinueMarker', location: statement.location} as LoopContinueMarker);
                 this.pushExecutionStack(body);
 
                 // TODO: CONDITION NEEDS TO BE A STATEMENT TO AN EXPRESSION
@@ -527,6 +705,19 @@ export class ProgramStateMachine {
             // Execute the body
             while (conditionResult && loopCount < MAX_LOOP_STEPS) {
                 this.executeStatement(body, false);
+
+                if (this.returnInProgress) {
+                    return;
+                }
+
+                if (this.continueInProgress) {
+                    this.continueInProgress = false;
+                    this.evaluateExpression(update, false);
+                    conditionResult = this.evaluateExpression(testCondition).value != 0;
+                    loopCount++;
+                    continue;
+                }
+
                 this.evaluateExpression(update, false);
                 conditionResult = this.evaluateExpression(testCondition).value != 0;
                 loopCount++;
@@ -546,6 +737,7 @@ export class ProgramStateMachine {
         let type: Type = typeSpecifierToType(typeSpecifier);
         let size = getTypeSize(type);
         let isStruct = type.primitiveType === PrimitiveType.STRUCT;
+        let isStructPointer = isStruct && type.pointerLevel > 0;
         let isArray = variable.arrayDimensions && variable.arrayDimensions.length > 0;
         let isArrayOfPointers = isArray && type.pointerLevel && type.pointerLevel > 0;
 
@@ -567,7 +759,7 @@ export class ProgramStateMachine {
         }
 
         // Handle structs
-        if (isStruct) {
+        if (isStruct && !isStructPointer) {
             let structName = typeSpecifier.name.substring(7);
             let struct = this.structTable.get(structName);
             console.log('Struct table', this.structTable);
@@ -591,21 +783,20 @@ export class ProgramStateMachine {
         const type = typeSpecifierToType(typeSpecifier);
         const isArray = variable.arrayDimensions && variable.arrayDimensions.length > 0;
         const isStruct = type.primitiveType === PrimitiveType.STRUCT;
+        const isStructPointer = isStruct && type.pointerLevel > 0;
 
-        if (isStruct)
+        if (isStruct && !isStructPointer)
             this.initializeStruct(typeSpecifier.name.substring(7), address, variable.init as AST.ArrayInitializer, variable.location);
 
         // Handle initialization
+        // Executes malloc immediately rather than in two steps
         if (variable.init) {
-            if (step && variable.init.type === 'FunctionCall') {
-                this.pushExecutionStack({
-                    type: 'ReturnAssignment',
-                    variableName: variable.id.name,
-                    address: address,
-                    initializer: variable.init
-                } as AST.ReturnAssignment);
-                this.pushExecutionStack(variable.init as AST.FunctionCall);
+            if (step && variable.init.type !== 'ArrayInitializer' && variable.init.type !== 'StringLiteral') {
+                this.evaluateInSteps(variable.init as AST.Expression, result => {
+                    this.memoryMachine.writeMemory(address, type, result.value);
+                });
             } else if ((isArray && variable.init.type === 'ArrayInitializer') || variable.init.type === 'StringLiteral') {
+
 
                 this.initializeArray(variable.id.name, address, variable.init as AST.ArrayInitializer, type, variable.arrayDimensions || []);
                 const varAss = this.getCurrentStackFrame().variables.get(variable.id.name);
@@ -637,6 +828,13 @@ export class ProgramStateMachine {
             console.log("Executing Variable Declaration", declaration);
         // Get the declarators
         let declarators: AST.Declarator[] = declaration.declarators;
+        // Finish each initializer in the caller before declaring the next item.
+        if (step && declarators.length > 1) {
+            for (const declarator of [...declarators].reverse()) {
+                this.pushExecutionStack({...declaration, declarators: [declarator]} as AST.VariableDeclaration);
+            }
+            return;
+        }
         // Per declarator
         for (let declarator of declarators) {
             // Get the variable
@@ -810,7 +1008,7 @@ export class ProgramStateMachine {
         }
     }
 
-    // Flatten an array initializer (large dimension to single dimension)
+    // Flatten an array initialiser (large dimension to single dimension)
     private flattenArrayInitializer(initializer: AST.ArrayInitializer): number[] {
         let result: number[] = [];
 
@@ -860,6 +1058,7 @@ export class ProgramStateMachine {
                     break;
                 }
             }
+
             for (let statement of compoundStack.reverse()) {
                 this.pushExecutionStack(statement);
             }
@@ -878,11 +1077,22 @@ export class ProgramStateMachine {
                         const type = typeSpecifierToType(typeSpecifier);
                         const size = getTypeSize(type);
 
-                        let init = null;
+                        let init: EvalResult | null = null;
                         if (variable.init) {
                             init = this.evaluateExpression(variable.init as AST.Expression);
                         }
-                        const declaredVariable = this.declareVariable(name, type, false, init, variable.location);
+                        // declareVariable expects forceSize before location. Passing location as
+                        // forceSize coerced the object to address 0 during stack allocation and
+                        // produced a false "Stack Overflow" for synchronous function calls used
+                        // inside larger expressions (for example: copy_value(5) + 4).
+                        const declaredVariable = this.declareVariable(
+                            name,
+                            type,
+                            false,
+                            init?.value,
+                            size,
+                            variable.location
+                        );
                         const address = declaredVariable.address;
                         if (!address)
                             throw new CMachineError('Memory Error', 'Variable not declared');
@@ -898,7 +1108,8 @@ export class ProgramStateMachine {
 
             for (let statement of body) {
                 this.executeStatement(statement);
-                if (statement.type === 'ReturnStatement') {
+
+                if (this.returnInProgress || this.continueInProgress) {
                     return;
                 }
             }
@@ -920,7 +1131,8 @@ export class ProgramStateMachine {
     // Recursively execute a function call
     private executeFunctionCall(
         statement: AST.FunctionCall,
-        step: boolean = false
+        step: boolean = false,
+        preparedArgs?: EvalResult[]
     ): EvalResult {
         let funcName = statement.functionIdentity.name;
         let func = this.functionTable.get(funcName);
@@ -940,7 +1152,8 @@ export class ProgramStateMachine {
             console.log(`Executing function: ${func.name}`);
 
         // Evaluate the arguments
-        let args = statement.arguments.map((arg) => this.evaluateExpression(arg));
+        const args = preparedArgs ?? statement.arguments.map(arg => this.evaluateExpression(arg));
+        if (this.expressionCache) throw new SuspendedCall(statement, args);
 
         let variableMap: Map<string, Variable> = new Map<string, Variable>();
 
@@ -949,7 +1162,6 @@ export class ProgramStateMachine {
             let arg = args[i];
 
             if (arg) {
-                // const declaredVariable = this.declareVariable(param.name, param.type, false, arg);
                 const address: number = this.memoryMachine.allocateOnStack(
                     getTypeSize(param.type),
                     `${func.name}_${param.name}`,
@@ -957,7 +1169,6 @@ export class ProgramStateMachine {
                     param.type,
                     statement.location
                 );
-                // const address = declaredVariable.address;
                 if (!address)
                     throw new CMachineError('Memory Error', 'Variable not declared');
 
@@ -972,6 +1183,8 @@ export class ProgramStateMachine {
             }
         }
 
+        const stackDepthBeforeCall = this.callStack.length;
+
         // Push a new stack frame
         this.pushStackFrame({
                 name: func.name,
@@ -984,19 +1197,27 @@ export class ProgramStateMachine {
         // Execute the function body
         if (func.body) {
             if (step) {
+                this.pushFunctionReturnMarker(func.name, func.body.location);
                 this.pushExecutionStack(func.body);
                 return {
                     value: this.returnRegister,
                     isLValue: false,
                     type: {primitiveType: PrimitiveType.INT, pointerLevel: 0}
-
                 };
-            } else
-                this.executeStatement(func.body);
-        }
-        // Pop the stack frame
+            } else {
+                const callerReturnInProgress = this.returnInProgress;
+                this.returnInProgress = false;
+                this.continueInProgress = false;
 
-        this.popStackFrame();
+                this.executeStatement(func.body);
+
+                this.returnInProgress = callerReturnInProgress;
+            }
+        }
+  
+        if (this.callStack.length > stackDepthBeforeCall) {
+            this.popStackFrame();
+        }
 
         const result: EvalResult = {
             isLValue: false,
@@ -1007,8 +1228,46 @@ export class ProgramStateMachine {
         return result;
     }
 
+    // Suspend only at an actually evaluated user call. Completed subexpressions
+    // are cached, so resuming does not repeat increments, allocation or output.
+    private evaluateInSteps(expression: AST.Expression, complete: (result: EvalResult) => void): void {
+        this.resumeExpression({type: 'DeferredExpression', expression,
+            location: expression.location, cache: new Map(), complete} as DeferredExpression);
+    }
+
+    private resumeExpression(marker: DeferredExpression): void {
+        if (marker.pending) {
+            const func = this.functionTable.get(marker.pending.functionIdentity.name)!;
+            marker.cache.set(marker.pending, {value: this.returnRegister,
+                type: func.returnType, isLValue: false});
+        }
+        this.expressionCache = marker.cache;
+        let result: EvalResult;
+        try {
+            result = this.evaluateExpression(marker.expression);
+        } catch (error) {
+            if (!(error instanceof SuspendedCall)) throw error;
+            this.expressionCache = null;
+            this.pushExecutionStack({...marker, pending: error.call});
+            this.executeFunctionCall(error.call, true, error.args);
+            return;
+        } finally {
+            this.expressionCache = null;
+        }
+        marker.complete(result);
+    }
+
+    private evaluateExpression(expression: AST.Expression, step: boolean = false): EvalResult {
+        const cache = this.expressionCache;
+        const cached = cache?.get(expression);
+        if (cached) return {...cached};
+        const result = this.evaluateExpressionValue(expression, step);
+        cache?.set(expression, {...result});
+        return result;
+    }
+
     // Evaluate an expression
-    private evaluateExpression(
+    private evaluateExpressionValue(
         expression: AST.Expression,
         step: boolean = false
     ): EvalResult {
@@ -1071,7 +1330,24 @@ export class ProgramStateMachine {
                 return this.evaluateArrayInitializer(expression as AST.ArrayInitializer);
             case 'MemberExpression':
                 return this.evaluateMemberExpression(expression as AST.MemberExpression);
-            default:
+            // Fixed 
+            case 'CastExpression': {
+                const castExpr = expression as AST.CastExpression;
+                const inner = this.evaluateExpression(castExpr.expression, step);
+                const targetType = typeSpecifierToType(castExpr.typeSpecifier);
+                let castValue = inner.value;
+                // Taking value and converting it to the correct type
+                if (targetType.primitiveType === PrimitiveType.INT) {
+                    castValue = Math.trunc(Number(inner.value));
+                } else if (targetType.primitiveType === PrimitiveType.FLOAT || 
+                        targetType.primitiveType === PrimitiveType.DOUBLE) {
+                    castValue = Number(inner.value);
+                } else if (targetType.primitiveType === PrimitiveType.CHAR) {
+                    castValue = Math.trunc(Number(inner.value)) & 0xFF;
+                }
+                return {isLValue: false, value: castValue, type: targetType};
+            }
+                default:
                 throw new CMachineError(
                     'Evaluation Error',
                     `Expression type not supported ${expression.type}`
@@ -1079,7 +1355,8 @@ export class ProgramStateMachine {
         }
     }
 
-    // Execute a sizeof expression
+    // Execute a sizeof expression; parser has been extended to accept multi-token syntax, e.g., from struct Node
+    // As named structs do not use default primitve size table, their size is retrieved from struct definitions
     private executeSizeOfExpression(expression: AST.SizeofExpression): EvalResult {
         let size = 0;
 
@@ -1094,9 +1371,10 @@ export class ProgramStateMachine {
                     throw new CMachineError('Execution Error', `Struct ${structName} not found`);
                 }
                 size = struct.size;
+            }else{
+                size = getTypeSize(type);
             }
 
-            size = getTypeSize(type);
         } else {
             let evalResult = this.evaluateExpression(expression.expression as AST.Expression);
 
@@ -1108,58 +1386,73 @@ export class ProgramStateMachine {
                 }
             } else
                 throw new CMachineError('Execution Error', 'Sizeof expression not supported');
+            
         }
-
 
         return {
             isLValue: false,
             value: size,
             type: {primitiveType: PrimitiveType.INT, pointerLevel: 0}
-        }
+        };
     }
 
     // Evaluate a member expression
+    // Allows chained access 
     private evaluateMemberExpression(expression: AST.MemberExpression): EvalResult {
-        let variableName = expression.object.name;
-        let memberName = expression.property.name;
-
-        // Find variable
-        let variable = this.lookupVariable(variableName);
-        if (!variable) {
-            throw new CMachineError('Machine Error', `Variable ${variableName} not found`);
+        // Evaluates left-hand side of expression for chained accesses like head->next->data
+        const objectEval = this.evaluateExpression(expression.object);
+        // Updated CMachineErrors based on data access 
+        if (objectEval.type.primitiveType !== PrimitiveType.STRUCT){
+            throw new CMachineError('Machine Error', 'Member access is only valid on structs');
         }
 
-        if (variable.type.customTypeName === undefined) {
-            throw new CMachineError('Machine Error', `Variable ${variableName} is not a struct`);
+        const structName = objectEval.type.customTypeName;
+        if (!structName){
+            throw new CMachineError('Machine Error', 'Struct type name not found for member access');
+
         }
 
-        let struct = this.structTable.get(variable.type.customTypeName);
-
+        const struct = this.structTable.get(structName);
         if (!struct) {
-            throw new CMachineError('Machine Error', `Struct ${variable.type.customTypeName} not found while evaluating members`);
+            throw new CMachineError('Machine Error', `Struct ${structName} not found while evaluating members`);
         }
 
-        let member = struct.members.get(memberName);
-        if (!member) {
-            throw new CMachineError('Machine Error', `Member ${memberName} not found in struct ${variable.type.customTypeName}`);
+        const member = struct.members.get(expression.property.name);
+        if (!member){
+            throw new CMachineError('Machine Error', `Member ${expression.property.name} not found in struct ${structName}`);
         }
 
-        let offset = member.offset;
+        let baseAddress: number | undefined;
+        if (expression.isPointer) {
+            if (objectEval.type.pointerLevel < 1) {
+                throw new CMachineError('Machine Error', 'Cannot use -> on a non-pointer');
+            }
+            baseAddress = objectEval.value as number;
+        } else {
+            baseAddress = objectEval.address;
+        }
 
-        // Get the address of the member
-        let memberAddress = variable.address + offset;
+        if (baseAddress == undefined){
+            throw new CMachineError('Machine Error', 'Member access requires a valid base address');
+        }
 
-        // Read the value from memory
+        // Adds offset to the chosen base address to find the member in memory 
+        const memberAddress = baseAddress + member.offset;
+
         return {
             isLValue: true,
             value: this.memoryMachine.readMemory(memberAddress, member.type),
             address: memberAddress,
             type: member.type
-        }
+        };
+
+
+
 
     }
 
     // Evaluate a Struct Definition
+    // Uses the correct struct layout for feilds like node next*
     private evaluateStructDefinition(expression: AST.StructDeclaration): void {
         let structName: string = expression.id.name;
         let members: Map<string, Field> = new Map<string, Field>();
@@ -1173,6 +1466,11 @@ export class ProgramStateMachine {
                 const field: VariableDeclarator = declarator as AST.VariableDeclarator;
                 const typeSpecifier: TypeSpecifier = field.typeSpecifier;
                 const type = typeSpecifierToType(typeSpecifier);
+                // Identified as a struct type in struct field so data can later be accessed 
+                // Same struct name kept so can tell which field it is pointing to in a chained access
+                if (type.primitiveType == PrimitiveType.STRUCT){
+                    type.customTypeName = typeSpecifier.name.substring(7);
+                }
                 const size: number = getTypeSize(type);
                 const name: string = field.id.name;
 
@@ -1194,15 +1492,22 @@ export class ProgramStateMachine {
         const array = this.evaluateExpression(expression.array);
         const index = this.evaluateExpression(expression.index);
 
-        const baseTypeSize = getTypeSize({
+        // Array subscripting advances by the size of the pointed-to element,
+        // not by the size of the pointer itself.  The old implementation used
+        // a pointer-sized stride for every array.  This was hidden for int
+        // arrays on the 32-bit model (both are four bytes), but made char
+        // arrays skip four bytes at a time: "Alice"[1] incorrectly read 'e'.
+        const elementPointerLevel = Math.max(array.type.pointerLevel - 1, 0);
+        let stride = getTypeSize({
             primitiveType: array.type.primitiveType,
-            pointerLevel: array.type.pointerLevel
+            pointerLevel: elementPointerLevel
         });
-
-        let stride = baseTypeSize;
         if (array.remainingDims && array.remainingDims.length > 1) {
             const product = array.remainingDims.slice(1).reduce((acc, dim) => acc * dim, 1);
-            stride *= product;
+            stride = getTypeSize({
+                primitiveType: array.type.primitiveType,
+                pointerLevel: 0
+            }) * product;
         }
 
         const offset = index.value * stride;
@@ -1212,12 +1517,15 @@ export class ProgramStateMachine {
 
         const newType = {
             primitiveType: array.type.primitiveType,
-            pointerLevel: (newRemainingDims && newRemainingDims.length > 0) ? 1 : 0
+            pointerLevel: elementPointerLevel
         };
 
-        const memory = (newType.pointerLevel === 0)
-            ? this.memoryMachine.readMemory(newAddress, newType)
-            : newAddress;
+        // A remaining array dimension denotes a sub-array, whose value is its
+        // address.  Once all dimensions have been indexed, read the element
+        // itself even when that element is a pointer (for example char *s[3]).
+        const memory = newRemainingDims.length > 0
+            ? newAddress
+            : this.memoryMachine.readMemory(newAddress, newType);
 
         console.log("value", memory, newAddress,);
         return {
@@ -1245,9 +1553,29 @@ export class ProgramStateMachine {
 
     }
 
+    // C truncates division toward zero when both operands undergo the usual
+    // arithmetic conversions to an integer type. JavaScript always produces a
+    // floating-point quotient, so applying `/` directly gives incorrect C
+    // results such as 2020 / 100 = 20.2 instead of 20.
+    private divideValues(left: EvalResult, right: EvalResult): number {
+        const resultType = implicitConversion(left.type, right.type);
+        const quotient = left.value / right.value;
+        const isFloatingPoint =
+            resultType.primitiveType === PrimitiveType.FLOAT ||
+            resultType.primitiveType === PrimitiveType.DOUBLE ||
+            resultType.primitiveType === PrimitiveType.LONG_DOUBLE;
+
+        return isFloatingPoint ? quotient : Math.trunc(quotient);
+    }
+
     // Evaluate a binary expression
     private evaluateBinaryExpression(expression: AST.BinaryExpression): EvalResult {
         let left: EvalResult = this.evaluateExpression(expression.left);
+        if ((expression.operator === '&&' && !left.value) ||
+            (expression.operator === '||' && left.value)) {
+            return {value: left.value ? 1 : 0, isLValue: false,
+                type: {primitiveType: PrimitiveType.INT, pointerLevel: 0}};
+        }
         let right: EvalResult = this.evaluateExpression(expression.right);
 
         if (expression.operator === '+' || expression.operator === '-' && (left.type?.pointerLevel > 0 || right.type?.pointerLevel > 0)) {
@@ -1290,7 +1618,7 @@ export class ProgramStateMachine {
             case '/':
                 return {
                     isLValue: false,
-                    value: left.value / right.value,
+                    value: this.divideValues(left, right),
                     type: implicitConversion(left.type, right.type)
                 }
             case '%':
@@ -1373,22 +1701,23 @@ export class ProgramStateMachine {
                     type: right.type
                 };
             case '/=':
+                const dividedValue = this.divideValues(left, right);
                 if (expression.left.type === "ArrayExpression") {
-                    this.assignArrayElement(left.address || 0, left.value / right.value);
+                    this.assignArrayElement(left.address || 0, dividedValue);
                     return {
                         isLValue: false,
-                        value: left.value / right.value,
+                        value: dividedValue,
                         type: right.type
                     };
                 }
                 this.handleAssignment(expression.left, {
                     isLValue: false,
-                    value: left.value / right.value,
+                    value: dividedValue,
                     type: right.type
                 });
                 return {
                     isLValue: false,
-                    value: left.value / right.value,
+                    value: dividedValue,
                     type: right.type
                 };
             case '%=':
@@ -1459,6 +1788,12 @@ export class ProgramStateMachine {
                     value: left.value >= right.value ? 1 : 0,
                     type: {primitiveType: PrimitiveType.INT, pointerLevel: 0}
                 }
+            case '&':
+                return {
+                    isLValue: false,
+                    value: left.value & right.value,
+                    type: {primitiveType: PrimitiveType.INT, pointerLevel: 0}
+                };
             case '&&':
                 return {
                     isLValue: false,
@@ -1479,7 +1814,7 @@ export class ProgramStateMachine {
         }
     }
 
-    // Handle variable assignemtn
+    // Handle variable assignment
     private handleAssignment(left: AST.Expression, right: EvalResult): void {
         if (left.type === 'Identifier') {
             // Get the variable
@@ -1503,8 +1838,23 @@ export class ProgramStateMachine {
             throw new CMachineError('Evaluation Error', 'Cannot assign to rvalue');
         }
 
-        if (!(leftEval.type.primitiveType === right.type.primitiveType && leftEval.type.pointerLevel === right.type.pointerLevel))
-            throw new CMachineError('Evaluation Error', `Type mismatch in assignment, trying to assign ${right.type.primitiveType} to ${leftEval.type.primitiveType}`);
+        if (!leftEval.type){
+            throw new CMachineError('Evaluation Error', 'Assignment target is missing type information');
+        }
+
+        // Allows NULL to be assigned to pointer variabls
+
+        const sameType = (!!right.type) && (leftEval.type.primitiveType === right.type.primitiveType) && (leftEval.type.pointerLevel === right.type.pointerLevel);
+
+        const nullPointerAssignment = (!!right.type) && (right.value === 0) && (right.type.primitiveType === PrimitiveType.INT) && (right.type.pointerLevel === 0) && (leftEval.type.pointerLevel > 0);
+
+        // Allows malloc results to be stored into pointer fields
+        const mallocPointerAssignment = (!right.type) && (typeof right.value === "number") && (leftEval.type.pointerLevel > 0);
+
+        if (!sameType && !nullPointerAssignment && !mallocPointerAssignment){
+            const rightTypeName = right.type ? right.type.primitiveType : "unknown";
+            throw new CMachineError('Evaluation Error', `Type mismatch in assignment, trying to assign ${rightTypeName} to ${leftEval.type.primitiveType}`);
+        }
 
         if (leftEval.address === undefined) {
             throw new CMachineError('Evaluation Error', 'Cannot assign to rvalue');
@@ -1513,18 +1863,6 @@ export class ProgramStateMachine {
         console.log('Writing to memory', leftEval.address, leftEval.type, right.value);
         this.memoryMachine.writeMemory(leftEval.address, leftEval.type, right.value);
 
-
-    }
-
-    // Gets increment size based on the type for pointer arithmetic
-    private getPointerIncrementSize(type: Type): number {
-        if (type.pointerLevel > 0) {
-            return getTypeSize({
-                primitiveType: type.primitiveType,
-                pointerLevel: type.pointerLevel - 1
-            });
-        }
-        return 1;
     }
 
     // Evaluate a prefix expression
@@ -1537,8 +1875,8 @@ export class ProgramStateMachine {
                     let variable = this.lookupVariable((expression.argument as AST.Identifier).name);
                     if (variable) {
                         let variableObject = this.getVariableValue(variable);
-                        let incrementSize = this.getPointerIncrementSize(variableObject.type);
-                        let variableCurrentValue = variableObject.value + incrementSize;
+                        let variableCurrentValue = variableObject.value
+                        variableCurrentValue += 1;
                         this.setVariableValue(variable, variableCurrentValue, variable.type);
                         return {
                             isLValue: false,
@@ -1546,17 +1884,6 @@ export class ProgramStateMachine {
                             type: variableObject.type
                         }
                     }
-                }
-            
-                if (argument.isLValue && argument.address !== undefined) {
-                    let incrementSize = this.getPointerIncrementSize(argument.type);
-                    let newValue = argument.value + incrementSize;
-                    this.memoryMachine.writeMemory(argument.address, argument.type, newValue);
-                    return {
-                        isLValue: false,
-                        value: newValue,
-                        type: argument.type
-                    };
                 }
                 return {
                     isLValue: false,
@@ -1568,8 +1895,8 @@ export class ProgramStateMachine {
                     let variable = this.lookupVariable((expression.argument as AST.Identifier).name);
                     if (variable) {
                         let variableObject = this.getVariableValue(variable);
-                        let incrementSize = this.getPointerIncrementSize(variableObject.type);
-                        let variableCurrentValue = variableObject.value - incrementSize;
+                        let variableCurrentValue = variableObject.value
+                        variableCurrentValue -= 1;
                         this.setVariableValue(variable, variableCurrentValue, variable.type);
                         return {
                             isLValue: false,
@@ -1577,17 +1904,6 @@ export class ProgramStateMachine {
                             type: variableObject.type
                         }
                     }
-                }
-                
-                if (argument.isLValue && argument.address !== undefined) {
-                    let incrementSize = this.getPointerIncrementSize(argument.type);
-                    let newValue = argument.value - incrementSize;
-                    this.memoryMachine.writeMemory(argument.address, argument.type, newValue);
-                    return {
-                        isLValue: false,
-                        value: newValue,
-                        type: argument.type
-                    };
                 }
                 return {
                     isLValue: false,
@@ -1611,8 +1927,7 @@ export class ProgramStateMachine {
                     if (variable) {
                         let variableObject = this.getVariableValue(variable);
                         let old = variableObject.value;
-                        let incrementSize = this.getPointerIncrementSize(variableObject.type);
-                        let variableCurrentValue = old + incrementSize;
+                        let variableCurrentValue = old + 1;
                         this.setVariableValue(variable, variableCurrentValue, variable.type);
                         return {
                             isLValue: false,
@@ -1620,16 +1935,6 @@ export class ProgramStateMachine {
                             type: variableObject.type
                         }
                     }
-                }
-                if (argument.isLValue && argument.address !== undefined) {
-                    let old = argument.value;
-                    let incrementSize = this.getPointerIncrementSize(argument.type);
-                    this.memoryMachine.writeMemory(argument.address, argument.type, old + incrementSize);
-                    return {
-                        isLValue: false,
-                        value: old,
-                        type: argument.type
-                    };
                 }
                 return {
                     isLValue: false,
@@ -1642,8 +1947,7 @@ export class ProgramStateMachine {
                     if (variable) {
                         let variableObject = this.getVariableValue(variable);
                         let old = variableObject.value;
-                        let incrementSize = this.getPointerIncrementSize(variableObject.type);
-                        let variableCurrentValue = old - incrementSize;
+                        let variableCurrentValue = old - 1;
                         this.setVariableValue(variable, variableCurrentValue, variable.type);
                         return {
                             isLValue: false,
@@ -1651,16 +1955,6 @@ export class ProgramStateMachine {
                             type: variableObject.type
                         }
                     }
-                }
-                if (argument.isLValue && argument.address !== undefined) {
-                    let old = argument.value;
-                    let incrementSize = this.getPointerIncrementSize(argument.type);
-                    this.memoryMachine.writeMemory(argument.address, argument.type, old - incrementSize);
-                    return {
-                        isLValue: false,
-                        value: old,
-                        type: argument.type
-                    };
                 }
                 return {
                     isLValue: false,
@@ -1697,14 +1991,14 @@ export class ProgramStateMachine {
             case '-':
                 return {
                     isLValue: false,
-                    value: -argument,
+                    value: -argument.value,
                     type: argument.type,
                 }
             case '!':
                 return {
                     isLValue: false,
-                    value: argument ? 0 : 1,
-                    type: argument.type,
+                    value: argument.value ? 0 : 1,
+                    type: {primitiveType: PrimitiveType.INT, pointerLevel: 0},
                 }
             default:
                 throw new CMachineError(
@@ -1771,6 +2065,17 @@ export class ProgramStateMachine {
 
     // Evaluate an identifier
     private evaluateIdentifier(expression: AST.Identifier): EvalResult {
+        // Now treats NULL like an inbuilt null pointer
+        if (expression.name == 'NULL'){
+            return{
+                isLValue: false,
+                value: 0,
+                type: {
+                    primitiveType: PrimitiveType.INT,
+                    pointerLevel: 0
+                }
+            };
+        }
         // Get the address of the variable
         let variable = this.lookupVariable(expression.name);
         // Check if the variable exists
@@ -1788,7 +2093,10 @@ export class ProgramStateMachine {
                 address: variable.address,
                 type: {
                     primitiveType: variable.type.primitiveType,
-                    pointerLevel: variable.arrayDimensions.length
+                    // An array expression adds its dimensions to any pointer
+                    // level already present in the declared element type.
+                    // For example, char *items[3] decays to char **.
+                    pointerLevel: variable.type.pointerLevel + variable.arrayDimensions.length
                 },
                 remainingDims: variable.arrayDimensions
             }
@@ -1802,7 +2110,6 @@ export class ProgramStateMachine {
                 type: variable.type
             }
         }
-
     }
 
     // Evaluate an array literal
@@ -1894,6 +2201,28 @@ export class ProgramStateMachine {
         switch (name) {
             case 'printf':
                 return this.handlePrintf(args);
+            case 'fprintf':
+                return this.handleFprintf(args);
+            case 'sqrt':
+                return this.handleSqrt(args);
+            case 'strcmp':
+                return this.handleStringCompare(args);
+            case 'fopen':
+                return this.handleFopen(args);
+            case 'fgets':
+                return this.handleFgets(args);
+            case 'fclose':
+                return this.handleFclose(args);
+            case 'rewind':
+                return this.handleRewind(args);
+            case 'access':
+                return this.handleAccess(args);
+            case 'atoi':
+                return this.handleAtoi(args);
+            case 'strcspn':
+                return this.handleStrcspn(args);
+            case 'strtok':
+                return this.handleStrtok(args);
             case 'strcpy':
                 return this.handleStringCopy(args);
             case 'strlen':
@@ -1902,16 +2231,330 @@ export class ProgramStateMachine {
                 return this.handleMalloc(args, location);
             case 'free':
                 return this.handleFree(args);
-            // case 'realloc':
-            // return this.handleRealloc(args);
-            // case 'calloc':
-            // return this.handleCalloc(args);
+            case 'realloc':
+                return this.handleRealloc(args, location);
+            case 'calloc':
+                return this.handleCalloc(args, location);
             default:
                 throw new CMachineError(
                     'Execution Error',
                     `Standard library function ${name} not found`
                 );
         }
+    }
+
+    // MATH: Handle square root using the host numeric implementation.
+    private handleSqrt(args: any[]): EvalResult {
+        if (args.length < 1) {
+            throw new CMachineError('Execution Error', 'sqrt requires 1 argument');
+        }
+
+        const argument = this.evaluateExpression(args[0]);
+        const value = Math.sqrt(Number(argument.value));
+        this.returnRegister = value;
+
+        return {
+            isLValue: false,
+            value,
+            type: {primitiveType: PrimitiveType.DOUBLE, pointerLevel: 0}
+        };
+    }
+
+    // Read a null-terminated C string from either a literal or virtual memory.
+    private readCStringArgument(argument: AST.Expression): number[] {
+        if (argument.type === 'StringLiteral') {
+            const decoded = (argument as AST.StringLiteral).value.replace(
+                /\\(n|r|t|\\|"|0)/g,
+                (_match, escape) => ({
+                    n: '\n',
+                    r: '\r',
+                    t: '\t',
+                    '\\': '\\',
+                    '"': '"',
+                    '0': '\0'
+                }[escape] ?? escape)
+            );
+            return Array.from(decoded)
+                .map((character) => character.charCodeAt(0));
+        }
+
+        const evaluated = this.evaluateExpression(argument);
+        const characters: number[] = [];
+        let address = evaluated.value;
+        let character = this.memoryMachine.readMemory(address, {
+            primitiveType: PrimitiveType.CHAR,
+            pointerLevel: 0
+        });
+
+        while (character !== 0) {
+            characters.push(character);
+            address++;
+            character = this.memoryMachine.readMemory(address, {
+                primitiveType: PrimitiveType.CHAR,
+                pointerLevel: 0
+            });
+        }
+
+        return characters;
+    }
+
+    // STRING: Compare two C strings and return a negative, zero, or positive int.
+    private handleStringCompare(args: AST.Expression[]): EvalResult {
+        if (args.length < 2) {
+            throw new CMachineError('Execution Error', 'strcmp requires 2 arguments');
+        }
+
+        const left = this.readCStringArgument(args[0]);
+        const right = this.readCStringArgument(args[1]);
+        const sharedLength = Math.min(left.length, right.length);
+        let comparison = 0;
+
+        for (let i = 0; i < sharedLength; i++) {
+            if (left[i] !== right[i]) {
+                comparison = left[i] - right[i];
+                break;
+            }
+        }
+
+        if (comparison === 0) {
+            comparison = left.length - right.length;
+        }
+
+        this.returnRegister = comparison;
+        return {
+            isLValue: false,
+            value: comparison,
+            type: {primitiveType: PrimitiveType.INT, pointerLevel: 0}
+        };
+    }
+
+    private cStringToText(argument: AST.Expression): string {
+        return this.readCStringArgument(argument)
+            .map((character) => String.fromCharCode(character))
+            .join('');
+    }
+
+    // FILE I/O is backed by deterministic in-browser coursework fixtures.
+    private handleFopen(args: AST.Expression[]): EvalResult {
+        if (args.length < 2) {
+            throw new CMachineError('Execution Error', 'fopen requires 2 arguments');
+        }
+
+        const filename = this.cStringToText(args[0]);
+        const mode = this.cStringToText(args[1]);
+
+        if (mode.startsWith('r') && !this.virtualFiles.has(filename)) {
+            this.returnRegister = 0;
+            return {
+                isLValue: false,
+                value: 0,
+                type: {primitiveType: PrimitiveType.FILE, pointerLevel: 1}
+            };
+        }
+
+        if (mode.startsWith('w')) this.virtualFiles.set(filename, '');
+        if (!this.virtualFiles.has(filename)) this.virtualFiles.set(filename, '');
+
+        const handle = this.nextFileHandle++;
+        this.openFiles.set(handle, {
+            filename,
+            mode,
+            position: mode.startsWith('a') ? (this.virtualFiles.get(filename)?.length ?? 0) : 0
+        });
+        this.returnRegister = handle;
+        return {
+            isLValue: false,
+            value: handle,
+            type: {primitiveType: PrimitiveType.FILE, pointerLevel: 1}
+        };
+    }
+
+    private handleFgets(args: AST.Expression[]): EvalResult {
+        if (args.length < 3) {
+            throw new CMachineError('Execution Error', 'fgets requires 3 arguments');
+        }
+
+        const buffer = Number(this.evaluateExpression(args[0]).value);
+        const size = Number(this.evaluateExpression(args[1]).value);
+        const handle = Number(this.evaluateExpression(args[2]).value);
+        const stream = this.openFiles.get(handle);
+        const charPointerType = {primitiveType: PrimitiveType.CHAR, pointerLevel: 1};
+
+        if (!stream || size <= 0) {
+            this.returnRegister = 0;
+            return {isLValue: false, value: 0, type: charPointerType};
+        }
+
+        const content = this.virtualFiles.get(stream.filename) ?? '';
+        if (stream.position >= content.length) {
+            this.returnRegister = 0;
+            return {isLValue: false, value: 0, type: charPointerType};
+        }
+
+        const maximumEnd = Math.min(stream.position + Math.max(size - 1, 0), content.length);
+        const newline = content.indexOf('\n', stream.position);
+        const end = newline >= stream.position && newline < maximumEnd
+            ? newline + 1
+            : maximumEnd;
+        const text = content.slice(stream.position, end);
+        const charType = {primitiveType: PrimitiveType.CHAR, pointerLevel: 0};
+
+        for (let i = 0; i < text.length; i++) {
+            this.memoryMachine.writeMemory(buffer + i, charType, text.charCodeAt(i));
+        }
+        this.memoryMachine.writeMemory(buffer + text.length, charType, 0);
+
+        stream.position = end;
+        this.returnRegister = buffer;
+        return {isLValue: false, value: buffer, address: buffer, type: charPointerType};
+    }
+
+    private handleFclose(args: AST.Expression[]): EvalResult {
+        if (args.length < 1) {
+            throw new CMachineError('Execution Error', 'fclose requires 1 argument');
+        }
+        const handle = Number(this.evaluateExpression(args[0]).value);
+        const result = this.openFiles.delete(handle) ? 0 : -1;
+        this.returnRegister = result;
+        return {
+            isLValue: false,
+            value: result,
+            type: {primitiveType: PrimitiveType.INT, pointerLevel: 0}
+        };
+    }
+
+    private handleFprintf(args: AST.Expression[]): EvalResult {
+        if (args.length < 2) {
+            throw new CMachineError('Execution Error', 'fprintf requires at least 2 arguments');
+        }
+
+        const handle = Number(this.evaluateExpression(args[0]).value);
+        const stream = this.openFiles.get(handle);
+        if (!stream || (!stream.mode.startsWith('w') && !stream.mode.startsWith('a'))) {
+            this.returnRegister = -1;
+            return {
+                isLValue: false,
+                value: -1,
+                type: {primitiveType: PrimitiveType.INT, pointerLevel: 0}
+            };
+        }
+
+        const output = this.formatOutput(args, 1);
+        const content = this.virtualFiles.get(stream.filename) ?? '';
+        const writePosition = stream.mode.startsWith('a') ? content.length : stream.position;
+        const updated = content.slice(0, writePosition) + output + content.slice(writePosition + output.length);
+        this.virtualFiles.set(stream.filename, updated);
+        stream.position = writePosition + output.length;
+        this.returnRegister = output.length;
+
+        return {
+            isLValue: false,
+            value: output.length,
+            type: {primitiveType: PrimitiveType.INT, pointerLevel: 0}
+        };
+    }
+
+    private handleRewind(args: AST.Expression[]): EvalResult {
+        if (args.length < 1) {
+            throw new CMachineError('Execution Error', 'rewind requires 1 argument');
+        }
+        const handle = Number(this.evaluateExpression(args[0]).value);
+        const stream = this.openFiles.get(handle);
+        if (stream) stream.position = 0;
+        this.returnRegister = 0;
+        return {
+            isLValue: false,
+            value: 0,
+            type: {primitiveType: PrimitiveType.INT, pointerLevel: 0}
+        };
+    }
+
+    private handleAccess(args: AST.Expression[]): EvalResult {
+        if (args.length < 1) {
+            throw new CMachineError('Execution Error', 'access requires a filename');
+        }
+        const filename = this.cStringToText(args[0]);
+        const result = this.virtualFiles.has(filename) ? 0 : -1;
+        this.returnRegister = result;
+        return {
+            isLValue: false,
+            value: result,
+            type: {primitiveType: PrimitiveType.INT, pointerLevel: 0}
+        };
+    }
+
+    private handleAtoi(args: AST.Expression[]): EvalResult {
+        if (args.length < 1) {
+            throw new CMachineError('Execution Error', 'atoi requires 1 argument');
+        }
+        const parsed = Number.parseInt(this.cStringToText(args[0]).trim(), 10);
+        const result = Number.isNaN(parsed) ? 0 : parsed;
+        this.returnRegister = result;
+        return {
+            isLValue: false,
+            value: result,
+            type: {primitiveType: PrimitiveType.INT, pointerLevel: 0}
+        };
+    }
+
+    private handleStrcspn(args: AST.Expression[]): EvalResult {
+        if (args.length < 2) {
+            throw new CMachineError('Execution Error', 'strcspn requires 2 arguments');
+        }
+        const text = this.readCStringArgument(args[0]);
+        const rejected = new Set(this.readCStringArgument(args[1]));
+        const found = text.findIndex((character) => rejected.has(character));
+        const result = found === -1 ? text.length : found;
+        this.returnRegister = result;
+        return {
+            isLValue: false,
+            value: result,
+            type: {primitiveType: PrimitiveType.INT, pointerLevel: 0}
+        };
+    }
+
+    private handleStrtok(args: AST.Expression[]): EvalResult {
+        if (args.length < 2) {
+            throw new CMachineError('Execution Error', 'strtok requires 2 arguments');
+        }
+
+        const supplied = Number(this.evaluateExpression(args[0]).value);
+        let address = supplied === 0 ? this.strtokNextAddress : supplied;
+        const pointerType = {primitiveType: PrimitiveType.CHAR, pointerLevel: 1};
+        if (address === null) {
+            this.returnRegister = 0;
+            return {isLValue: false, value: 0, type: pointerType};
+        }
+
+        const delimiters = new Set(this.readCStringArgument(args[1]));
+        const charType = {primitiveType: PrimitiveType.CHAR, pointerLevel: 0};
+        let character = this.memoryMachine.readMemory(address, charType);
+        while (character !== 0 && delimiters.has(character)) {
+            address++;
+            character = this.memoryMachine.readMemory(address, charType);
+        }
+
+        if (character === 0) {
+            this.strtokNextAddress = null;
+            this.returnRegister = 0;
+            return {isLValue: false, value: 0, type: pointerType};
+        }
+
+        const tokenStart = address;
+        while (character !== 0 && !delimiters.has(character)) {
+            address++;
+            character = this.memoryMachine.readMemory(address, charType);
+        }
+
+        if (character === 0) {
+            this.strtokNextAddress = null;
+        } else {
+            this.memoryMachine.writeMemory(address, charType, 0);
+            this.strtokNextAddress = address + 1;
+        }
+
+        this.returnRegister = tokenStart;
+        return {isLValue: false, value: tokenStart, address: tokenStart, type: pointerType};
     }
 
     // Handle free function
@@ -1979,6 +2622,17 @@ export class ProgramStateMachine {
     private isStandardLibFunction(name: string): boolean {
         switch (name) {
             case 'printf':
+            case 'fprintf':
+            case 'sqrt':
+            case 'strcmp':
+            case 'fopen':
+            case 'fgets':
+            case 'fclose':
+            case 'rewind':
+            case 'access':
+            case 'atoi':
+            case 'strcspn':
+            case 'strtok':
             case 'malloc':
             case 'realloc':
             case 'strlen':
@@ -2000,6 +2654,12 @@ export class ProgramStateMachine {
             primitiveType: PrimitiveType.INT,
             pointerLevel: 0
         }, location);
+        // Preserve an explicit sizeof(struct ...) hint for the optional node view.
+        const operand = args[0]?.type === 'SizeofExpression' ? args[0].expression : null;
+        if (operand?.type === 'TypeSpecifier' && operand.name.startsWith('struct ')) {
+            const allocation = this.memoryMachine.getMemoryInfo(address);
+            if (allocation) allocation.type = {...allocation.type, customTypeName: operand.name.substring(7)};
+        }
         this.returnRegister = address;
         return {
             isLValue: false,
@@ -2008,29 +2668,139 @@ export class ProgramStateMachine {
         }
     }
 
-    // Support printf function (mocked in js)
-    private handlePrintf(args: any[]): void {
-        if (args.length === 0) return;
-        const formatString = args[0] as AST.StringLiteral;
+    getHeapStructDefinition(allocation: import('@CMachine/CMemory.ts').MemoryAllocation): StructDefinition | undefined {
+        if (allocation.type.customTypeName) return this.structTable.get(allocation.type.customTypeName);
+        const scopes = [this.globalScope, ...this.callStack.map(frame => frame.variables)];
+        for (const scope of scopes) {
+            for (const variable of scope.values()) {
+                if (variable.type.primitiveType === PrimitiveType.STRUCT && variable.type.pointerLevel === 1 &&
+                    variable.type.customTypeName && this.getVariableValue(variable).value === allocation.start) {
+                    return this.structTable.get(variable.type.customTypeName);
+                }
+            }
+        }
+        return undefined;
+    }
+
+    // Supports realloc function to resize heap allocation and return a new address
+    private handleRealloc(args: any[], location: Location): any {
+        if (args.length < 2) {
+            throw new CMachineError('Execution Error', 'realloc needs 2 arguments');
+        }
+        const pointer = this.evaluateExpression(args[0]);
+        const newSize = this.evaluateExpression(args[1]).value;
+        const oldAddress = pointer.value;
+
+        if (oldAddress=== 0) {
+            return this.handleMalloc([args[1]], location);
+        }
+
+        if (newSize === 0) {
+            this.memoryMachine.freeMemory(oldAddress);
+            this.returnRegister = 0;
+
+            return {
+                isLValue: false,
+                value: 0,
+                address: 0,
+            };
+        }
+
+        const newAddress = this.memoryMachine.reallocateMemory(
+            oldAddress,
+            newSize,
+            {
+                primitiveType: PrimitiveType.INT,
+                pointerLevel: 0
+            },
+            location
+        );
+
+        this.returnRegister = newAddress;
+
+        return {
+            isLValue: false,
+            value: newAddress,
+            address: newAddress,
+        };
+    }
+
+    // Supports calloc function to allocate heap memory and fills it with 0s
+private handleCalloc(args: any[], location: Location):any {
+    if (args.length < 2) {
+        throw new CMachineError('Execution Error', 'calloc needs 2 arguments');
+    }
+    const count = this.evaluateExpression(args[0]).value;
+    const elementSize = this.evaluateExpression(args[1]).value;
+    const totalSize = count * elementSize;
+
+    const zeroValues = new Array(Math.ceil(totalSize/ getPrimitiveTypeSize(PrimitiveType.INT))).fill(0);
+
+    const address = this.memoryMachine.allocateOnHeap(
+        totalSize,
+        `calloc_${this.mallocCounter++}`,
+        zeroValues,
+        {
+            primitiveType: PrimitiveType.INT,
+            pointerLevel: 0
+        },
+        location
+    );
+
+    this.returnRegister = address;
+
+    return {
+        isLValue: false,
+        value: address,
+        address: address,
+    };
+}
+
+    private formatOutput(args: AST.Expression[], formatIndex: number): string {
+        const formatString = args[formatIndex] as AST.StringLiteral;
         if (formatString.type !== 'StringLiteral') {
             throw new CMachineError('Execution Error', 'Format string not provided');
         }
 
-        formatString.value = formatString.value.replace(/\\(n|t|\\|")/g, (match, p1) => p1 === 'n' ? '\n' : p1 === 't' ? '\t' : p1);
+        const decodedFormat = formatString.value.replace(/\\(n|t|\\|")/g, (match, p1) => p1 === 'n' ? '\n' : p1 === 't' ? '\t' : p1);
 
         let output = '';
-        let argIndex = 1;
+        let argIndex = formatIndex + 1;
 
-        for (let i = 0; i < formatString.value.length; i++) {
-            if (formatString.value[i] === '%' && i + 1 < formatString.value.length) {
-                i++;
-                switch (formatString.value[i]) {
+        for (let i = 0; i < decodedFormat.length; i++) {
+            if (decodedFormat[i] === '%' && i + 1 < decodedFormat.length) {
+                const conversionStart = i;
+                let cursor = i + 1;
+
+                if (decodedFormat[cursor] === '%') {
+                    output += '%';
+                    i = cursor;
+                    continue;
+                }
+
+                // Accept the commonly used printf form %[flags][width][.precision]type.
+                while ('-+ #0'.includes(decodedFormat[cursor] ?? '')) cursor++;
+                while (/\d/.test(decodedFormat[cursor] ?? '')) cursor++;
+
+                let precision: number | undefined;
+                if (decodedFormat[cursor] === '.') {
+                    cursor++;
+                    const precisionStart = cursor;
+                    while (/\d/.test(decodedFormat[cursor] ?? '')) cursor++;
+                    precision = cursor > precisionStart
+                        ? Number(decodedFormat.slice(precisionStart, cursor))
+                        : 0;
+                }
+
+                const conversion = decodedFormat[cursor];
+                i = cursor;
+                switch (conversion) {
                     case 'd':
                     case 'i':
                         output += this.evaluateExpression(args[argIndex++]).value;
                         break;
                     case 'f':
-                        output += this.evaluateExpression(args[argIndex++]).value.toFixed(6);
+                        output += this.evaluateExpression(args[argIndex++]).value.toFixed(precision ?? 6);
                         break;
                     case 's':
                         let string = '';
@@ -2058,16 +2828,21 @@ export class ProgramStateMachine {
                         );
                         break;
                     default:
-                        output += '%' + formatString.value[i];
+                        output += decodedFormat.slice(conversionStart, cursor + 1);
                         break;
                 }
             } else {
-                output += formatString.value[i];
+                output += decodedFormat[i];
             }
         }
 
-        this.virtualLog(output);
+        return output;
+    }
 
+    // Support printf function (mocked in js)
+    private handlePrintf(args: AST.Expression[]): void {
+        if (args.length === 0) return;
+        this.virtualLog(this.formatOutput(args, 0));
     }
 
     // Map top level functions to the function table
@@ -2341,8 +3116,3 @@ export class ProgramStateMachine {
     }
 
 }
-
-
-
-
-

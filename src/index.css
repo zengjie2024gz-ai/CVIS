@@ -102,8 +102,9 @@
     }
 }
 
+/* Changed to yellow to match original prototypes */
 .highlight-line {
-    background-color: rgba(255, 165, 0, 0.3);
-    border-left: 3px solid #ffa500;
+    background-color: rgba(255, 240, 120, 0.55);
+    border-left: 2px solid #d4b000;
 }
 

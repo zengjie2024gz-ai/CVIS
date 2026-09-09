@@ -12,7 +12,7 @@ describe('Memory Tests', () => {
                 expect(memory).toBeInstanceOf(VirtualMemoryMachine);
 
                 expect(memory.StackPointer).toEqual(512);
-                expect(memory.HeapPointer).toEqual(0);
+                expect(memory.HeapPointer).toEqual(4);
                 expect(memory.BSSPointer).toEqual(0);
                 expect(memory.DataPointer).toEqual(0);
                 expect(memory.MemorySize).toEqual(512);
@@ -25,7 +25,7 @@ describe('Memory Tests', () => {
                 expect(memory).toBeInstanceOf(VirtualMemoryMachine);
 
                 expect(memory.StackPointer).toEqual(12);
-                expect(memory.HeapPointer).toEqual(0);
+                expect(memory.HeapPointer).toEqual(4);
                 expect(memory.BSSPointer).toEqual(0);
                 expect(memory.DataPointer).toEqual(0);
                 expect(memory.MemorySize).toEqual(12);
@@ -83,7 +83,9 @@ describe('Memory Tests', () => {
                     allocated: true,
                     regionType: 'bss',
                     type: {primitiveType: PrimitiveType.INT, pointerLevel: 0},
-                } as MemoryAllocation);
+                    location: undefined,
+                    value: undefined
+                });
 
             });
 
@@ -181,14 +183,14 @@ describe('Memory Tests', () => {
                     pointerLevel: 0
                 });
 
-                expect(address).toBe(0);
+                expect(address).toBe(4);
 
                 let allocation = memory.MemoryAllocated.filter(allocation => allocation.start === address)[0];
 
                 expect(allocation).toBeDefined();
 
                 expect(allocation).toEqual({
-                    start: 0,
+                    start: 4,
                     size: 4,
                     identifier: 'foo',
                     allocated: true,
@@ -217,9 +219,9 @@ describe('Memory Tests', () => {
                     pointerLevel: 0
                 });
 
-                expect(address1).toBe(0);
-                expect(address2).toBe(4);
-                expect(address3).toBe(8);
+                expect(address1).toBe(4);
+                expect(address2).toBe(8);
+                expect(address3).toBe(12);
 
                 let allocation1 = memory.MemoryAllocated.filter(allocation => allocation.start === address1)[0];
                 let allocation2 = memory.MemoryAllocated.filter(allocation => allocation.start === address2)[0];
@@ -230,7 +232,7 @@ describe('Memory Tests', () => {
                 expect(allocation3).toBeDefined();
 
                 expect(allocation1).toEqual({
-                    start: 0,
+                    start: 4,
                     size: 4,
                     identifier: 'foo',
                     allocated: true,
@@ -240,7 +242,7 @@ describe('Memory Tests', () => {
                 } as MemoryAllocation);
 
                 expect(allocation2).toEqual({
-                    start: 4,
+                    start: 8,
                     size: 4,
                     identifier: 'bar',
                     allocated: true,
@@ -250,7 +252,7 @@ describe('Memory Tests', () => {
                 } as MemoryAllocation);
 
                 expect(allocation3).toEqual({
-                    start: 8,
+                    start: 12,
                     size: 4,
                     identifier: 'baz',
                     allocated: true,
@@ -275,9 +277,9 @@ describe('Memory Tests', () => {
                     pointerLevel: 0
                 });
 
-                expect(address1).toBe(0);
-                expect(address2).toBe(4);
-                expect(address3).toBe(8);
+                expect(address1).toBe(4);
+                expect(address2).toBe(8);
+                expect(address3).toBe(12);
 
                 memory.freeMemory(address2);
 
@@ -286,7 +288,7 @@ describe('Memory Tests', () => {
                     pointerLevel: 0
                 });
 
-                expect(address4).toBe(4);
+                expect(address4).toBe(8);
 
                 let allocation1 = memory.MemoryAllocated.filter(allocation => allocation.start === address1)[0];
                 let allocation3 = memory.MemoryAllocated.filter(allocation => allocation.start === address3)[0];
@@ -297,17 +299,18 @@ describe('Memory Tests', () => {
                 expect(allocation4).toBeDefined();
 
                 expect(allocation1).toEqual({
-                    start: 0,
+                    start: 4,
                     size: 4,
                     identifier: 'foo',
                     allocated: true,
                     regionType: 'heap',
                     type: {primitiveType: PrimitiveType.INT, pointerLevel: 0},
+                    location: undefined,
                     value: 10
-                } as MemoryAllocation);
+                });
 
                 expect(allocation3).toEqual({
-                    start: 8,
+                    start: 12,
                     size: 4,
                     identifier: 'baz',
                     allocated: true,
@@ -318,14 +321,14 @@ describe('Memory Tests', () => {
 
 
                 expect(allocation4).toEqual({
-                    start: 4,
+                    start: 8,
                     size: 4,
                     identifier: 'qux',
                     allocated: true,
                     regionType: 'heap',
                     type: {primitiveType: PrimitiveType.INT, pointerLevel: 0},
                     value: 15
-                } as MemoryAllocation);
+                });
 
 
             });
@@ -344,7 +347,7 @@ describe('Memory Tests', () => {
                 expect(allocation).toBeDefined();
 
                 expect(allocation).toEqual({
-                    start: 0,
+                    start: 4, // shifted
                     size: 8,
                     identifier: 'foo',
                     allocated: true,
@@ -365,7 +368,7 @@ describe('Memory Tests', () => {
                     pointerLevel: 0
                 });
 
-                expect(address).toBe(0);
+                expect(address).toBe(4);
 
                 let values = memory.readMemorySegment(address, 4);
 

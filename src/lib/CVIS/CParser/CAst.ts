@@ -153,7 +153,8 @@ export interface FunctionCall extends Expression {
 // Astraction (not proper C)
 export interface MemberExpression extends Expression {
     type: "MemberExpression";
-    object: Identifier;
+    // Object changed to allow identifier to be another expression ie head->next
+    object: Expression;
     property: Identifier;
     isPointer: boolean;
 }

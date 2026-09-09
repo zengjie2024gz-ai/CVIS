@@ -77,6 +77,14 @@ export class Scanner {
         // Skip whitespace
         this.skipWhitespace();
 
+        // Preprocessor directives such as #include are handled by the host
+        // environment rather than by the teaching VM.  Ignore the directive
+        // line while preserving line/column information for the C program.
+        if (this.currentChar === "#") {
+            this.skipPreprocessorDirective();
+            return this.getNextToken();
+        }
+
         // Check for eof
         if (this.position >= this.source.length) {
             return {
@@ -132,6 +140,13 @@ export class Scanner {
 
         // Did not match any token
         throw this.createError("Invalid character");
+    };
+
+    private skipPreprocessorDirective = (): void => {
+        while (this.currentChar !== "" && this.currentChar !== "\n") {
+            this.move();
+        }
+        if (this.currentChar === "\n") this.move();
     };
 
     getAllTokens = (): Token[] => {
@@ -203,6 +218,9 @@ export class Scanner {
                 break;
             case "void":
                 type = TokenType.KEYWORD_VOID;
+                break;
+            case "FILE":
+                type = TokenType.KEYWORD_FILE;
                 break;
             case "long":
                 type = TokenType.KEYWORD_LONG;

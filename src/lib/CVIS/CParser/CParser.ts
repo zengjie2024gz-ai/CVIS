@@ -131,6 +131,13 @@ export class Parser {
             throw new ParserError("Unexpected end of input", token, TokenType.EOF);
         }
 
+        // C99 and later permit declarations after executable statements in a
+        // block. Keep such declarations in the body so the machine executes
+        // their initialisers at the correct point in program order.
+        if (this.isDeclaration(token)) {
+            return this.parseDeclaration() as AST.Statement;
+        }
+
         let statement: AST.Statement;
 
         // Check which statement type to parse
@@ -1239,7 +1246,9 @@ export class Parser {
     };
 
     // Parse size of expression
+    // Supports single-token types (such as int) and names structs such as Node
     private parseSizeOf = (token: Token, parser: Parser): AST.Expression => {
+        // When sizeOf is applied to a struct type, the struct identifier is captured to match 'struct_name' form
         const sizeOf = parser.tokens.expect(
             TokenType.KEYWORD_SIZEOF,
             "Expected sizeof keyword",
@@ -1249,50 +1258,46 @@ export class Parser {
             "Expected opening parenthesis",
         ); // Consume the opening parenthesis
 
-        const type = parser.tokens.peek();
-        if (this.isTypeSpecifier(type)) {
-            const typeSpecifier = this.typeToString(type.type);
-            parser.tokens.consume(); // Consume the type specifier
+        // Addition: allowing the parser to handle multiple types of tokens 
+        const nextToken = parser.tokens.peek();
+
+        if (this.isTypeSpecifier(nextToken)) {
+            const typeSpecifier = parser.parseTypeSpecifier();
+            if (typeSpecifier.name == "struct"){
+                const structId = this.parseIdentifier(parser.tokens.peek(), parser) as AST.Identifier;
+                typeSpecifier.name = `struct_${structId.name}`;
+            }
+
             parser.tokens.expect(
-                TokenType.PUNCT_RPAREN,
-                "Expected closing parenthesis",
-            ); // Consume the closing parenthesis
+                TokenType.PUNCT_RPAREN, "Expected closing parenthesis"
+            );
 
             const sizeOfExpression: AST.SizeofExpression = {
                 type: "SizeofExpression",
-                expression: {
-                    type: "TypeSpecifier",
-                    name: typeSpecifier,
-                    location: {
-                        line: type.line,
-                        column: type.column,
-                    },
-                },
+                expression: typeSpecifier,
                 location: {
                     line: sizeOf.line,
                     column: sizeOf.column,
                 },
             };
-
-            return sizeOfExpression;
-        } else {
-            const expression = parser.parseExpression(0);
-            parser.tokens.expect(
-                TokenType.PUNCT_RPAREN,
-                "Expected closing parenthesis",
-            ); // Consume the closing parenthesis
-
-            const sizeOfExpression: AST.SizeofExpression = {
-                type: "SizeofExpression",
-                expression: expression,
-                location: {
-                    line: sizeOf.line,
-                    column: sizeOf.column,
-                },
-            };
-
             return sizeOfExpression;
         }
+
+        const expression = parser.parseExpression(0);
+        parser.tokens.expect(
+            TokenType.PUNCT_RPAREN,
+            "Expected closing parenthesis",
+        ); // Consume the closing parenthesis
+        
+        const sizeOfExpression: AST.SizeofExpression = {
+            type: "SizeofExpression",
+            expression: expression,
+            location: {
+                line: sizeOf.line,
+                column: sizeOf.column,
+            },
+        };
+        return sizeOfExpression;
     };
 
     // Parse type cast expression
@@ -1303,7 +1308,8 @@ export class Parser {
             "Expected closing parenthesis",
         ); // Consume the closing parenthesis
 
-        const expression = parser.parseExpression(0);
+        // A cast binds to its unary operand, not the remaining binary expression.
+        const expression = parser.parseExpression(13);
 
         const typeCast: AST.CastExpression = {
             type: "CastExpression",
@@ -1485,7 +1491,7 @@ export class Parser {
 
         let memberAccess: AST.MemberExpression = {
             type: "MemberExpression",
-            object: identifier,
+            object: left,
             location: {
                 line: token.line,
                 column: token.column,
@@ -1540,7 +1546,7 @@ export class Parser {
     ): AST.Expression => {
         parser.tokens.consume(); // Consume the operator
 
-        const right = parser.parseExpression(token.precedence);
+        const right = parser.parseExpression(13);
 
         const unaryExpression: AST.UnaryExpression = {
             type: "UnaryExpression",
@@ -1768,6 +1774,7 @@ export class Parser {
             token.type === TokenType.KEYWORD_INT ||
             token.type === TokenType.KEYWORD_CHAR ||
             token.type === TokenType.KEYWORD_VOID ||
+            token.type === TokenType.KEYWORD_FILE ||
             token.type === TokenType.KEYWORD_FLOAT ||
             token.type === TokenType.KEYWORD_DOUBLE ||
             token.type === TokenType.KEYWORD_STRUCT ||
@@ -1804,6 +1811,8 @@ export class Parser {
                 return "char";
             case TokenType.KEYWORD_VOID:
                 return "void";
+            case TokenType.KEYWORD_FILE:
+                return "FILE";
             case TokenType.KEYWORD_FLOAT:
                 return "float";
             case TokenType.KEYWORD_DOUBLE:
@@ -2188,4 +2197,3 @@ type ParseFunction =
     | PrefixParseFunction
     | InfixParseFunction
     | PostfixParseFunction;
-

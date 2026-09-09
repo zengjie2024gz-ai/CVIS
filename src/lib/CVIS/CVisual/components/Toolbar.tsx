@@ -56,20 +56,12 @@ export const Toolbar = () => {
                                 </Link>
                             </SidebarMenuButton>
                         </SidebarMenuItem>
-                        {/*<SidebarMenuItem>*/}
-                        {/*    <SidebarMenuButton asChild onClick={() => handleItemClick("Help")}*/}
-                        {/*                       data-active={activeItem === "Help"}>*/}
-                        {/*        <Link to="/help" className="flex items-center gap-3 px-3 py-2">*/}
-                        {/*            <HelpCircle className="h-5 w-5"/>*/}
-                        {/*            <span>Help</span>*/}
-                        {/*        </Link>*/}
-                        {/*    </SidebarMenuButton>*/}
-                        {/*</SidebarMenuItem>*/}
+
                     </SidebarMenu>
                 </SidebarGroup>
             </SidebarContent>
             <SidebarFooter className="h-14 border-t flex items-center justify-center">
-                <small>By Ben McIlveen 2025</small>
+                <small>Originated by Ben McIlveen, extended by Tabitha Blindu 2026</small>
             </SidebarFooter>
         </Sidebar>
     )

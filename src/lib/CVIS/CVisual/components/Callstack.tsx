@@ -34,8 +34,23 @@ export const Callstack = ({snapshot}: { snapshot: ProgramSnapshot }) => {
         }));
     };
 
+    // Updated to provide helpful explanation when there is an empty stack frame
     if (callStack.length === 0) {
-        return null;
+        return(
+            <Card className="w-full shadow-md py-3">
+                <CardContent className="p-4">
+                    <div className="rounded-md border bg-muted/30 p-4 text-sm text-muted-foreground">
+                        <div className="font-semibold text-foreground">
+                            No active stack frame
+                        </div>
+                        <div className="mt-1">
+                            The program has finished running, so the main stack frame has been removed.
+                            Any heap allocations still shown are memory that was not freed before the program ended.
+                        </div>
+                    </div>
+                </CardContent>
+            </Card>
+        );
     }
 
 
@@ -43,12 +58,14 @@ export const Callstack = ({snapshot}: { snapshot: ProgramSnapshot }) => {
         const value = cMachine.getVariableValue(variable).value;
         const formattedValue = formatVariableValue(variable, value, cMachine);
         const linkedDetails = getLinkedAllocationDetails(variable, value, cMachine);
+        const pointerAliases = getPointerAliases(name, variable, snapshot, cMachine);
 
         return {
             name,
             variable,
             formattedValue,
-            linkedDetails
+            linkedDetails,
+            pointerAliases
         };
     });
 
@@ -77,12 +94,14 @@ export const Callstack = ({snapshot}: { snapshot: ProgramSnapshot }) => {
                                         const value = cMachine.getVariableValue(variable).value;
                                         const formattedValue = formatVariableValue(variable, value, cMachine);
                                         const linkedDetails = getLinkedAllocationDetails(variable, value, cMachine);
+                                        const pointerAliases = getPointerAliases(name, variable, snapshot, cMachine);
 
                                         return {
                                             name,
                                             variable,
                                             formattedValue,
-                                            linkedDetails
+                                            linkedDetails,
+                                            pointerAliases
                                         };
                                     });
 
@@ -118,6 +137,7 @@ const GlobalVariablesSection = ({
         variable: Variable;
         formattedValue: string;
         linkedDetails: LinkedAllocationDetails | null;
+        pointerAliases: string[];
     }>;
 }) => {
     return (
@@ -168,6 +188,7 @@ const StackFrameComponent = ({
         variable: Variable;
         formattedValue: string;
         linkedDetails: LinkedAllocationDetails | null;
+        pointerAliases: string[];
     }>;
     cMachine: ProgramStateMachine;
 }) => {
@@ -197,13 +218,14 @@ const StackFrameComponent = ({
             {isExpanded && (
                 <div className="px-3 pb-3">
                     <div className="rounded-md border bg-card">
-                        {variablesData.map(({name, variable, formattedValue, linkedDetails}, varIndex) => (
+                        {variablesData.map(({name, variable, formattedValue, linkedDetails, pointerAliases}, varIndex) => (
                             <FrameVariableComponent
                                 key={name}
                                 name={name}
                                 variable={variable}
                                 formattedValue={formattedValue}
                                 linkedDetails={linkedDetails}
+                                pointerAliases={pointerAliases}
                                 varIndex={varIndex}
                                 totalVars={variablesData.length}
                                 cMachine={cMachine}
@@ -221,6 +243,7 @@ const FrameVariableComponent = ({
                                     variable,
                                     formattedValue,
                                     linkedDetails,
+                                    pointerAliases,
                                     varIndex,
                                     totalVars,
                                     cMachine
@@ -229,12 +252,28 @@ const FrameVariableComponent = ({
     variable: Variable;
     formattedValue: string;
     linkedDetails: LinkedAllocationDetails | null;
+    pointerAliases: string[];
     varIndex: number;
     totalVars: number;
     cMachine: ProgramStateMachine;
 }) => {
-    const isPointer = variable.pointerLevel && variable.pointerLevel > 0 ? true : false;
+    // Important to work out if the variable is a pointer before it is rendered so it can be labelled correctly 
+    let isPointer= false;
 
+    if(variable.pointerLevel && variable.pointerLevel> 0){
+        isPointer= true;
+    }
+
+    let pointerLevelBadge= null;
+
+    if(isPointer){
+        pointerLevelBadge= (
+            <Badge variant="secondary" className="font-mono h-6">
+                {"*".repeat(variable.type.pointerLevel)}
+            </Badge>
+        );
+    }
+    
     return (
         <div>
             <div className="p-3 relative">
@@ -245,11 +284,13 @@ const FrameVariableComponent = ({
                         <span className="font-mono font-medium text-primary">{name}</span>
                     </div>
                     <div className="flex gap-1.5">
-                        {isPointer ? (
-                            <Badge variant="secondary" className="font-mono h-6">
-                                {"*".repeat(variable.type.pointerLevel)}
+                        {pointerLevelBadge}
+
+                        {pointerAliases.length >0 &&(
+                            <Badge variant="outline" className="font-mono h-6 border-blue-400 text-blue-600">
+                                aliases: {pointerAliases.join(", ")}
                             </Badge>
-                        ) : null}
+                        )}
                     </div>
                 </div>
 
@@ -380,6 +421,55 @@ type LinkedAllocationDetails = {
     data: any;
 } | null;
 
+
+// Finds other pointer variables that store the same address, e.g, when head and temp point to the same node
+function getPointerAliases(
+    variableName: string,
+    variable: Variable,
+    snapshot: ProgramSnapshot,
+    cMachine: ProgramStateMachine
+): string[]{
+    const aliases: string[] = [];
+
+    if (!variable.type.pointerLevel || variable.type.pointerLevel === 0){
+        return aliases;
+    }
+
+    const pointerValue = cMachine.getVariableValue(variable).value;
+    if (pointerValue === 0){
+        return aliases;
+    }
+
+    snapshot.globalScope.forEach((otherVariable, otherName) =>{
+        if (!otherVariable.type.pointerLevel || otherVariable.type.pointerLevel === 0){
+            return;
+        }
+        const otherValue= cMachine.getVariableValue(otherVariable).value;
+        if (otherValue === pointerValue && otherName !== variableName){
+            aliases.push(otherName);
+        }
+    });
+
+    for(let i= 0; i< snapshot.callStack.length; i++){
+        const frame= snapshot.callStack[i];
+
+        frame.variables.forEach((otherVariable, otherName)=> {
+            if(!otherVariable.type.pointerLevel|| otherVariable.type.pointerLevel=== 0){
+                return;
+            }
+
+            const otherValue= cMachine.getVariableValue(otherVariable).value;
+
+            if(
+                otherName !== variableName && otherValue === pointerValue && aliases.indexOf(otherName)=== -1
+            ){
+                aliases.push(otherName);
+            }
+        });
+    }
+    return aliases;
+
+}
 
 function formatVariableValue(variable: Variable, value: any, cMachine: ProgramStateMachine): string {
     const {type, address, arrayDimensions} = variable;
